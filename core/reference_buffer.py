@@ -128,7 +128,7 @@ async def extract_current_message_images(
 ) -> list[ImageData]:
     images: list[ImageData] = []
     for component in _iter_message_components(event):
-        if isinstance(component, Comp.Image):
+        if _is_image_component(component):
             await _append_downloaded_image(images, component, download_image)
     return images
 
@@ -139,9 +139,9 @@ async def extract_reply_message_images(
 ) -> list[ImageData]:
     images: list[ImageData] = []
     for component in _iter_message_components(event):
-        if isinstance(component, Comp.Reply) and component.chain:
-            for sub_component in component.chain:
-                if isinstance(sub_component, Comp.Image):
+        if _is_reply_component(component):
+            for sub_component in _reply_chain(component):
+                if _is_image_component(sub_component):
                     await _append_downloaded_image(images, sub_component, download_image)
     return images
 
@@ -160,12 +160,50 @@ def _iter_message_components(event: MessageEventLike) -> list[object]:
     return list(message or [])
 
 
+def _is_image_component(component: object) -> bool:
+    if isinstance(component, Comp.Image):
+        return True
+    if component.__class__.__name__ == "Image":
+        return True
+    return _component_image_url(component) is not None
+
+
+def _is_reply_component(component: object) -> bool:
+    return isinstance(component, Comp.Reply) or component.__class__.__name__ == "Reply"
+
+
+def _reply_chain(component: object) -> list[object]:
+    chain = getattr(component, "chain", None)
+    if isinstance(chain, list):
+        return chain
+    message = getattr(component, "message", None)
+    if isinstance(message, list):
+        return message
+    return []
+
+
+def _component_image_url(component: object) -> str | None:
+    for attr in ("url", "file", "path"):
+        value = getattr(component, attr, None)
+        if value:
+            return str(value)
+
+    data = getattr(component, "data", None)
+    if isinstance(data, dict):
+        for key in ("url", "file", "path"):
+            value = data.get(key)
+            if value:
+                return str(value)
+
+    return None
+
+
 async def _append_downloaded_image(
     images: list[ImageData],
-    component: Comp.Image,
+    component: object,
     download_image: ImageDownloader,
 ) -> None:
-    url = component.url or component.file
+    url = _component_image_url(component)
     if not url:
         return
 

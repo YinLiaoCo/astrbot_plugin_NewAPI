@@ -65,10 +65,22 @@ class MicuImageDemoPlugin(Star):
             await self.adapter.close()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def cache_reference_images(self, event: AstrMessageEvent):
-        """Silently cache images from non-command messages."""
-        message = (event.message_str or "").strip()
-        if message.startswith(("/", "／")):
+    async def handle_message(self, event: AstrMessageEvent):
+        """Handle demo commands and silently cache non-command images."""
+        if not self._is_friend_message(event):
+            return
+
+        message = self._get_event_text(event)
+        command = self._parse_demo_command(message)
+
+        if command == "reset":
+            self.reference_buffer.clear(event.unified_msg_origin)
+            yield event.plain_result("已重置当前会话参考图")
+            return
+
+        if command == "generate":
+            async for result in self._handle_generate_command(event, message):
+                yield result
             return
 
         count = await self.reference_buffer.cache_plain_message_images(
@@ -80,13 +92,7 @@ class MicuImageDemoPlugin(Star):
                 f"[MicuDemo] 已缓存 {count} 张参考图，UMO={event.unified_msg_origin}"
             )
 
-    @filter.command("重置")
-    async def reset_references(self, event: AstrMessageEvent):
-        self.reference_buffer.clear(event.unified_msg_origin)
-        yield event.plain_result("已重置当前会话参考图")
-
-    @filter.command("生图")
-    async def generate_image(self, event: AstrMessageEvent):
+    async def _handle_generate_command(self, event: AstrMessageEvent, message: str):
         if not self.adapter or not self.provider_config:
             yield event.plain_result("请先在插件配置中添加 micu_gpt_image2 供应商、Base URL 和 API Key")
             return
@@ -95,7 +101,11 @@ class MicuImageDemoPlugin(Star):
             event,
             self._download_image,
         )
-        parsed = parse_generate_command(event.message_str or "", selection.has_images)
+        logger.info(
+            f"[MicuDemo] 收到生图命令，UMO={event.unified_msg_origin}，"
+            f"文本={message!r}，参考图来源={selection.source}，参考图数量={len(selection.images)}"
+        )
+        parsed = parse_generate_command(message, selection.has_images)
         if not parsed.ok or not parsed.command:
             yield event.plain_result(parsed.error or "格式错误，请使用 /生图 尺寸: 1k 提示词")
             return
@@ -119,6 +129,24 @@ class MicuImageDemoPlugin(Star):
         )
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
+
+    def _parse_demo_command(self, message: str) -> str | None:
+        text = message.strip()
+        for prefix in ("/", "／"):
+            if text.startswith(f"{prefix}重置"):
+                return "reset"
+            if text.startswith(f"{prefix}生图"):
+                return "generate"
+
+        # Some adapters may remove the wake prefix before plugins see message_str.
+        if text == "重置" or text.startswith("重置 "):
+            return "reset"
+        if text == "生图" or text.startswith("生图 "):
+            return "generate"
+        return None
+
+    def _is_friend_message(self, event: AstrMessageEvent) -> bool:
+        return ":FriendMessage:" in str(getattr(event, "unified_msg_origin", ""))
 
     async def _generate_and_send(
         self,
@@ -205,7 +233,8 @@ class MicuImageDemoPlugin(Star):
 
     async def _download_image(self, url: str) -> tuple[bytes, str] | None:
         try:
-            path = Path(url)
+            clean_url = url[7:] if url.startswith("file://") else url
+            path = Path(clean_url)
             if path.exists() and path.is_file():
                 data = path.read_bytes()
             else:
@@ -222,6 +251,50 @@ class MicuImageDemoPlugin(Star):
         except Exception as exc:
             logger.warning(f"[MicuDemo] 提取参考图失败: {exc}")
             return None
+
+    def _get_event_text(self, event: AstrMessageEvent) -> str:
+        candidates = [
+            str(getattr(event, "message_str", "") or ""),
+            str(getattr(getattr(event, "message_obj", None), "message_str", "") or ""),
+            self._text_from_components(getattr(getattr(event, "message_obj", None), "message", None)),
+            self._text_from_raw_message(getattr(getattr(event, "message_obj", None), "raw_message", None)),
+        ]
+        return max((item.strip() for item in candidates), key=len, default="")
+
+    def _text_from_components(self, components: Any) -> str:
+        if not isinstance(components, list):
+            return ""
+
+        parts: list[str] = []
+        for component in components:
+            if component.__class__.__name__ == "Plain":
+                text = getattr(component, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+
+    def _text_from_raw_message(self, raw_message: Any) -> str:
+        if isinstance(raw_message, str):
+            return raw_message
+        if not isinstance(raw_message, dict):
+            return ""
+
+        message = raw_message.get("message") or raw_message.get("raw_message")
+        if isinstance(message, str):
+            return message
+        if not isinstance(message, list):
+            return ""
+
+        parts: list[str] = []
+        for item in message:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                data = item.get("data") or {}
+                text = data.get("text")
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
 
     def _request_size_ok(self, images: list[tuple[bytes, str]]) -> bool:
         if not self.provider_config:
