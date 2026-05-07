@@ -1,24 +1,295 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from __future__ import annotations
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+import asyncio
+import hashlib
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import astrbot.api.message_components as Comp
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, register
+from astrbot.core.star.star_tools import StarTools
+from astrbot.core.utils.io import download_image_by_url
+
+from .adapter import MicuGPTImage2Adapter, MicuImageInput
+from .core import ReferenceBuffer, parse_generate_command
+
+
+@dataclass(frozen=True)
+class MicuProviderConfig:
+    base_url: str
+    api_key: str
+    proxy: str | None
+    max_reference_images: int
+    max_request_size_mb: int
+
+
+@register("astrbot_plugin_NewAPI", "cl", "米醋 gpt-image-2-pro Demo", "0.1.0")
+class MicuImageDemoPlugin(Star):
+    """Minimal demo for Micu gpt-image-2-pro generation."""
+
+    def __init__(self, context: Context, config: Any):
         super().__init__(context)
+        self.context = context
+        self.config = config or {}
+        self.reference_buffer = ReferenceBuffer()
+        self.provider_config = self._load_provider_config()
+        self.adapter: MicuGPTImage2Adapter | None = None
+        self.tasks: set[asyncio.Task] = set()
+
+        self.data_dir = Path(StarTools.get_data_dir()) / "astrbot_plugin_NewAPI"
+        self.cache_dir = self.data_dir / "cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        if not self.provider_config:
+            logger.warning("[MicuDemo] 未配置 micu_gpt_image2 供应商，/生图 将不可用")
+            return
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        self.adapter = MicuGPTImage2Adapter(
+            base_url=self.provider_config.base_url,
+            api_key=self.provider_config.api_key,
+            proxy=self.provider_config.proxy,
+        )
+        logger.info("[MicuDemo] 插件加载完成，模型固定为 gpt-image-2-pro")
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        for task in list(self.tasks):
+            task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+        if self.adapter:
+            await self.adapter.close()
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def cache_reference_images(self, event: AstrMessageEvent):
+        """Silently cache images from non-command messages."""
+        message = (event.message_str or "").strip()
+        if message.startswith(("/", "／")):
+            return
+
+        count = await self.reference_buffer.cache_plain_message_images(
+            event,
+            self._download_image,
+        )
+        if count:
+            logger.info(
+                f"[MicuDemo] 已缓存 {count} 张参考图，UMO={event.unified_msg_origin}"
+            )
+
+    @filter.command("重置")
+    async def reset_references(self, event: AstrMessageEvent):
+        self.reference_buffer.clear(event.unified_msg_origin)
+        yield event.plain_result("已重置当前会话参考图")
+
+    @filter.command("生图")
+    async def generate_image(self, event: AstrMessageEvent):
+        if not self.adapter or not self.provider_config:
+            yield event.plain_result("请先在插件配置中添加 micu_gpt_image2 供应商、Base URL 和 API Key")
+            return
+
+        selection = await self.reference_buffer.select_for_command(
+            event,
+            self._download_image,
+        )
+        parsed = parse_generate_command(event.message_str or "", selection.has_images)
+        if not parsed.ok or not parsed.command:
+            yield event.plain_result(parsed.error or "格式错误，请使用 /生图 尺寸: 1k 提示词")
+            return
+
+        images = selection.images[: self.provider_config.max_reference_images]
+        if not self._request_size_ok(images):
+            yield event.plain_result("参考图过大，已超过当前供应商 max_request_size_mb 限制")
+            return
+
+        yield event.plain_result("正在生图中，可以继续写提示词")
+
+        self.reference_buffer.clear_after_task_created(event.unified_msg_origin)
+        task = asyncio.create_task(
+            self._generate_and_send(
+                prompt=parsed.command.prompt,
+                unified_msg_origin=event.unified_msg_origin,
+                images=images,
+                source=selection.source,
+                reply_message_id=self._get_message_id(event),
+            )
+        )
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def _generate_and_send(
+        self,
+        prompt: str,
+        unified_msg_origin: str,
+        images: list[tuple[bytes, str]],
+        source: str,
+        reply_message_id: str | None,
+    ) -> None:
+        if not self.adapter:
+            return
+
+        task_id = hashlib.md5(f"{time.time()}{unified_msg_origin}".encode()).hexdigest()[:8]
+        try:
+            if images:
+                inputs = [
+                    MicuImageInput(
+                        data=data,
+                        filename=f"reference_{index}{self._extension_for_mime(mime)}",
+                        content_type=mime,
+                    )
+                    for index, (data, mime) in enumerate(images, start=1)
+                ]
+                generated = await self.adapter.image_to_image(prompt, inputs)
+            else:
+                generated = await self.adapter.text_to_image(prompt)
+        except Exception as exc:
+            logger.error(f"[MicuDemo] 任务 {task_id} 生成失败: {exc}", exc_info=True)
+            await self.context.send_message(
+                unified_msg_origin,
+                MessageChain().message(f"生成失败: {exc}"),
+            )
+            return
+
+        file_paths = self._save_generated_images(task_id, generated)
+        if not file_paths:
+            await self.context.send_message(
+                unified_msg_origin,
+                MessageChain().message("生成完成，但未能保存图片文件"),
+            )
+            return
+
+        chain, used_reply = self._build_result_chain(file_paths, reply_message_id)
+        logger.info(
+            f"[MicuDemo] 任务 {task_id} 发送图片，参考图来源={source}，"
+            f"尝试引用={bool(reply_message_id)}，引用成功={used_reply}"
+        )
+        await self.context.send_message(unified_msg_origin, chain)
+
+    def _load_provider_config(self) -> MicuProviderConfig | None:
+        providers = self.config.get("api_providers", [])
+        if not isinstance(providers, list):
+            return None
+
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            if provider.get("__template_key") != "micu_gpt_image2":
+                continue
+
+            base_url = str(provider.get("base_url") or "").strip()
+            api_keys = [
+                str(key).strip()
+                for key in provider.get("api_keys", [])
+                if str(key).strip()
+            ]
+            if not base_url or not api_keys:
+                return None
+
+            return MicuProviderConfig(
+                base_url=base_url,
+                api_key=api_keys[0],
+                proxy=str(provider.get("proxy") or "").strip() or None,
+                max_reference_images=max(
+                    1,
+                    int(provider.get("max_reference_images") or 1),
+                ),
+                max_request_size_mb=max(
+                    1,
+                    int(provider.get("max_request_size_mb") or 20),
+                ),
+            )
+        return None
+
+    async def _download_image(self, url: str) -> tuple[bytes, str] | None:
+        try:
+            path = Path(url)
+            if path.exists() and path.is_file():
+                data = path.read_bytes()
+            else:
+                file_name = f"ref_{hashlib.md5(url.encode()).hexdigest()[:12]}"
+                target = self.cache_dir / file_name
+                downloaded = await download_image_by_url(url, path=str(target))
+                if not downloaded:
+                    return None
+                data = Path(downloaded).read_bytes()
+
+            if not data:
+                return None
+            return data, self._detect_mime_type(data)
+        except Exception as exc:
+            logger.warning(f"[MicuDemo] 提取参考图失败: {exc}")
+            return None
+
+    def _request_size_ok(self, images: list[tuple[bytes, str]]) -> bool:
+        if not self.provider_config:
+            return False
+        total = sum(len(data) for data, _ in images)
+        return total <= self.provider_config.max_request_size_mb * 1024 * 1024
+
+    def _save_generated_images(self, task_id: str, images: list[bytes]) -> list[str]:
+        paths: list[str] = []
+        for index, image in enumerate(images, start=1):
+            digest = hashlib.md5(image).hexdigest()[:8]
+            path = self.cache_dir / f"gen_{task_id}_{index}_{digest}.png"
+            path.write_bytes(image)
+            paths.append(str(path))
+        return paths
+
+    def _build_result_chain(
+        self,
+        file_paths: list[str],
+        reply_message_id: str | None,
+    ) -> tuple[MessageChain, bool]:
+        chain = MessageChain()
+        used_reply = self._try_prepend_reply(chain, reply_message_id)
+        for file_path in file_paths:
+            chain.file_image(file_path)
+        return chain, used_reply
+
+    def _try_prepend_reply(self, chain: MessageChain, message_id: str | None) -> bool:
+        if not message_id:
+            return False
+
+        for kwargs in ({"id": message_id}, {"message_id": message_id}):
+            try:
+                reply = Comp.Reply(**kwargs)
+            except Exception as exc:
+                logger.debug(f"[MicuDemo] Reply 构造失败 {kwargs}: {exc}")
+                continue
+
+            for attr in ("chain", "message_chain", "messages"):
+                items = getattr(chain, attr, None)
+                if isinstance(items, list):
+                    items.insert(0, reply)
+                    return True
+
+            logger.info("[MicuDemo] MessageChain 未暴露可插入 Reply 的列表，退化为普通发图")
+            return False
+
+        logger.info("[MicuDemo] 当前 Reply 组件构造方式不可用，退化为普通发图")
+        return False
+
+    def _get_message_id(self, event: AstrMessageEvent) -> str | None:
+        message_obj = getattr(event, "message_obj", None)
+        message_id = getattr(message_obj, "message_id", None)
+        return str(message_id) if message_id else None
+
+    def _detect_mime_type(self, data: bytes) -> str:
+        if data.startswith(b"\xff\xd8"):
+            return "image/jpeg"
+        if data.startswith(b"GIF"):
+            return "image/gif"
+        if data.startswith(b"RIFF") and b"WEBP" in data[:16]:
+            return "image/webp"
+        return "image/png"
+
+    def _extension_for_mime(self, mime: str) -> str:
+        return {
+            "image/jpeg": ".jpg",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/png": ".png",
+        }.get(mime, ".png")
