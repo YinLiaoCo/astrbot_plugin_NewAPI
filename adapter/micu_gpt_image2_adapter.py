@@ -33,12 +33,18 @@ class MicuGPTImage2Adapter:
         base_url: str,
         api_key: str,
         *,
+        text_to_image_endpoint: str = "/v1/images/generations",
+        image_to_image_endpoint: str = "/v1/images/edits",
+        multi_image_endpoint: str = "/v1/chat/completions",
         proxy: str | None = None,
         timeout: int = 180,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.text_to_image_endpoint = text_to_image_endpoint
+        self.image_to_image_endpoint = image_to_image_endpoint
+        self.multi_image_endpoint = multi_image_endpoint
         self.proxy = proxy
         self.timeout = timeout
         self._session = session
@@ -57,7 +63,7 @@ class MicuGPTImage2Adapter:
             "size": size,
             "response_format": RESPONSE_FORMAT,
         }
-        return await self._post_json("/v1/images/generations", payload)
+        return await self._post_json(self.text_to_image_endpoint, payload)
 
     async def image_to_image(
         self,
@@ -97,7 +103,7 @@ class MicuGPTImage2Adapter:
                 content_type=image.content_type,
             )
 
-        return await self._post_form("/v1/images/edits", form)
+        return await self._post_form(self.image_to_image_endpoint, form)
 
     async def _post_chat_with_images(
         self,
@@ -122,7 +128,7 @@ class MicuGPTImage2Adapter:
         }
 
         async with self._session_or_new().post(
-            f"{self.base_url}/v1/chat/completions",
+            self._url_for(self.multi_image_endpoint),
             headers={**self._headers(), "Content-Type": "application/json"},
             json=payload,
             proxy=self.proxy,
@@ -135,7 +141,7 @@ class MicuGPTImage2Adapter:
         headers["Content-Type"] = "application/json"
         aiohttp = self._aiohttp()
         async with self._session_or_new().post(
-            f"{self.base_url}{path}",
+            self._url_for(path),
             headers=headers,
             json=payload,
             proxy=self.proxy,
@@ -146,13 +152,21 @@ class MicuGPTImage2Adapter:
     async def _post_form(self, path: str, form: aiohttp.FormData) -> list[bytes]:
         aiohttp = self._aiohttp()
         async with self._session_or_new().post(
-            f"{self.base_url}{path}",
+            self._url_for(path),
             headers=self._headers(),
             data=form,
             proxy=self.proxy,
             timeout=aiohttp.ClientTimeout(total=self.timeout),
         ) as response:
             return await self._handle_response(response)
+
+    def _url_for(self, endpoint: str) -> str:
+        value = endpoint.strip()
+        if value.startswith(("http://", "https://")):
+            return value
+        if not value.startswith("/"):
+            value = f"/{value}"
+        return f"{self.base_url}{value}"
 
     async def _handle_response(self, response: aiohttp.ClientResponse) -> list[bytes]:
         raw_text = await response.text()

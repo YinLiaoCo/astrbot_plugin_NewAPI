@@ -2,32 +2,62 @@
   "api_providers": {
     "type": "template_list",
     "description": "API 供应商配置",
-    "hint": "Demo 只使用 micu_gpt_image2 供应商，模型固定为 gpt-image-2-pro",
+    "hint": "配置生图接口分组。当前插件会按用户余额条目中选择的分组调用对应接口。",
     "templates": {
-      "micu_gpt_image2": {
-        "name": "米醋 gpt-image-2-pro",
-        "hint": "用于最小 Demo 验证文生图、图生图和响应解析",
+      "provider": {
+        "name": "添加供应商",
+        "hint": "每个条目的分组名称必须唯一",
         "items": {
           "name": {
-            "description": "适配器名称",
+            "description": "分组名称",
             "type": "string",
-            "default": "micu_gpt_image2"
+            "default": "API",
+            "hint": "用户余额管理里的选择分组填写这个名称。重复名称会在插件运行时自动追加数字。"
+          },
+          "remark": {
+            "description": "备注",
+            "type": "string",
+            "default": "用于最小 Demo 验证文生图、图生图和响应解析"
           },
           "base_url": {
             "description": "API Base URL",
             "type": "string",
-            "default": ""
+            "default": "",
+            "hint": "接口地址字段填写 /v1/... 路径时，会拼接到该 Base URL；填写完整 URL 时直接使用完整 URL。"
+          },
+          "text_to_image_enabled": {
+            "description": "启用文生图",
+            "type": "bool",
+            "default": true
+          },
+          "text_to_image_endpoint": {
+            "description": "文生图接口地址",
+            "type": "string",
+            "default": "/v1/images/generations",
+            "hint": "仅在启用文生图时生效。"
+          },
+          "image_to_image_enabled": {
+            "description": "启用图生图",
+            "type": "bool",
+            "default": true
+          },
+          "image_to_image_endpoint": {
+            "description": "图生图接口地址",
+            "type": "string",
+            "default": "/v1/images/edits",
+            "hint": "仅在启用图生图时生效，用于单张参考图。"
+          },
+          "multi_reference_endpoint": {
+            "description": "多参考图接口地址",
+            "type": "string",
+            "default": "/v1/chat/completions",
+            "hint": "仅在启用图生图时生效，用于多张参考图；如果你的模型不单独区分多参考图，可保持默认。"
           },
           "proxy": {
             "description": "代理地址",
             "hint": "例如 http://127.0.0.1:7890；留空则不使用代理",
             "type": "string",
             "default": ""
-          },
-          "api_keys": {
-            "description": "API Keys",
-            "type": "list",
-            "default": []
           },
           "max_reference_images": {
             "description": "最大参考图数量",
@@ -38,18 +68,6 @@
             "description": "最大请求体大小 MB",
             "type": "int",
             "default": 20
-          },
-          "capability_options": {
-            "description": "模型能力",
-            "type": "list",
-            "options": [
-              "文生图",
-              "图生图"
-            ],
-            "default": [
-              "文生图",
-              "图生图"
-            ]
           }
         }
       }
@@ -61,8 +79,20 @@
     "hint": "配置允许使用生图的会话 UMO 与充值额度",
     "templates": {
       "user": {
-        "name": "余额用户",
+        "name": "添加用户",
         "items": {
+          "name": {
+            "description": "用户名称",
+            "type": "string",
+            "default": "用户",
+            "hint": "用于区分配置面板中的用户条目；重复名称会在插件运行时自动追加数字。"
+          },
+          "enabled_status_display": {
+            "description": "条目状态",
+            "type": "string",
+            "default": "用户（启用）",
+            "hint": "展示用字段；保存或插件同步后会按启用状态更新。"
+          },
           "enabled": {
             "description": "启用用户",
             "type": "bool",
@@ -72,6 +102,18 @@
             "description": "用户 UMO",
             "type": "string",
             "default": ""
+          },
+          "provider_group": {
+            "description": "选择分组",
+            "type": "string",
+            "default": "API",
+            "hint": "填写 API 供应商配置中的分组名称。当前 AstrBot schema 不支持从另一个配置列表动态生成下拉选项。"
+          },
+          "api_key": {
+            "description": "API Key",
+            "type": "string",
+            "default": "",
+            "hint": "每个用户只能配置一条 API Key。"
           },
           "balance_display": {
             "description": "用户余额",

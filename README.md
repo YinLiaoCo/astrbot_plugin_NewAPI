@@ -12,17 +12,26 @@
 
 ## 配置
 
-在插件配置中新增 `micu_gpt_image2` 供应商：
+在插件配置中新增 API 供应商分组：
 
-- `base_url`: 米醋 API Base URL。
-- `api_keys`: 至少填一个 API Key。
+- `name`: 分组名称，用户余额管理里通过该名称选择供应商。
+- `remark`: 备注。
+- `base_url`: API Base URL。
+- `text_to_image_enabled`: 是否启用文生图。
+- `text_to_image_endpoint`: 文生图接口地址。
+- `image_to_image_enabled`: 是否启用图生图。
+- `image_to_image_endpoint`: 单参考图图生图接口地址。
+- `multi_reference_endpoint`: 多参考图接口地址。
 - `max_reference_images`: Demo 默认 `1`。
 - `max_request_size_mb`: Demo 默认 `20`。
 
 在插件配置中新增 `balance_users` 余额用户：
 
+- `name`: 用户名称。
 - `umo`: 允许使用生图的会话 UMO。
 - `enabled`: 关闭后该 UMO 禁止生图。
+- `provider_group`: 选择供应商分组，填写 API 供应商配置中的分组名称。
+- `api_key`: 该用户使用的一条 API Key。
 - `cost_per_image`: 每生成 1 张图扣除的额度。
 - `add_amount`: 充值额度；插件加载或检查余额时会写入真实余额并归零。
 - `balance_display`: 只作展示，真实余额以插件数据目录中的 `balances.json` 为准。

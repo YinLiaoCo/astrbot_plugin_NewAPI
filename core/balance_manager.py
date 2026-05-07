@@ -10,9 +10,12 @@ from typing import Any
 @dataclass(frozen=True)
 class BalanceUser:
     umo: str
+    name: str
     enabled: bool
     balance: float
     cost_per_image: float
+    provider_group: str
+    api_key: str
 
 
 @dataclass(frozen=True)
@@ -46,15 +49,23 @@ class BalanceManager:
     def sync_from_config(self) -> None:
         users: dict[str, BalanceUser] = {}
         changed = False
+        used_names: set[str] = set()
 
         for entry in self._balance_entries():
             umo = str(entry.get("umo") or "").strip()
             if not umo:
                 continue
 
+            name = self._unique_name(
+                str(entry.get("name") or "").strip() or "用户",
+                used_names,
+            )
+            used_names.add(name)
             enabled = bool(entry.get("enabled", True))
             cost = self._non_negative_float(entry.get("cost_per_image"), 0.1)
             balance = self._stored_balance(umo)
+            provider_group = str(entry.get("provider_group") or "").strip() or "API"
+            api_key = str(entry.get("api_key") or "").strip()
 
             add_amount = self._float(entry.get("add_amount"), 0.0)
             if add_amount:
@@ -66,11 +77,15 @@ class BalanceManager:
                 self._ensure_record(umo, balance, cost)
 
             entry["balance_display"] = self.format_amount(balance)
+            entry["enabled_status_display"] = f"{name}（{'启用' if enabled else '禁用'}）"
             users[umo] = BalanceUser(
                 umo=umo,
+                name=name,
                 enabled=enabled,
                 balance=balance,
                 cost_per_image=cost,
+                provider_group=provider_group,
+                api_key=api_key,
             )
 
         self._users = users
@@ -116,6 +131,20 @@ class BalanceManager:
             )
 
         return BalancePrecheckResult(True, user=user)
+
+    def user_config(self, umo: str) -> dict[str, Any] | None:
+        self.sync_from_config()
+        user = self._users.get(umo)
+        if user is None:
+            return None
+        return {
+            "name": user.name,
+            "umo": user.umo,
+            "enabled": user.enabled,
+            "provider_group": user.provider_group,
+            "api_key": user.api_key,
+            "cost_per_image": user.cost_per_image,
+        }
 
     def charge(self, umo: str, image_count: int) -> BalanceChargeResult:
         self.sync_from_config()
@@ -216,3 +245,11 @@ class BalanceManager:
 
     def _round_amount(self, value: float) -> float:
         return round(float(value), 6)
+
+    def _unique_name(self, base_name: str, existing: set[str]) -> str:
+        name = base_name
+        index = 1
+        while name in existing:
+            name = f"{base_name}{index}"
+            index += 1
+        return name

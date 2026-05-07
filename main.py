@@ -21,11 +21,22 @@ from .core import BalanceManager, ReferenceBuffer, parse_generate_command
 
 @dataclass(frozen=True)
 class MicuProviderConfig:
+    name: str
     base_url: str
-    api_key: str
+    text_to_image_endpoint: str
+    image_to_image_endpoint: str
+    multi_reference_endpoint: str
+    supports_text_to_image: bool
+    supports_image_to_image: bool
     proxy: str | None
     max_reference_images: int
     max_request_size_mb: int
+
+
+@dataclass(frozen=True)
+class MicuRuntimeConfig:
+    provider: MicuProviderConfig
+    api_key: str
 
 
 @register("astrbot_plugin_NewAPI", "cl", "米醋 gpt-image-2-pro Demo", "0.1.0")
@@ -37,8 +48,7 @@ class MicuImageDemoPlugin(Star):
         self.context = context
         self.config = config or {}
         self.reference_buffer = ReferenceBuffer()
-        self.provider_config = self._load_provider_config()
-        self.adapter: MicuGPTImage2Adapter | None = None
+        self.provider_configs = self._load_provider_configs()
         self.tasks: set[asyncio.Task] = set()
 
         self.data_dir = Path(StarTools.get_data_dir()) / "astrbot_plugin_NewAPI"
@@ -47,24 +57,17 @@ class MicuImageDemoPlugin(Star):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     async def initialize(self):
-        if not self.provider_config:
-            logger.warning("[MicuDemo] 未配置 micu_gpt_image2 供应商，/生图 将不可用")
+        if not self.provider_configs:
+            logger.warning("[MicuDemo] 未配置可用 API 供应商，/生图 将不可用")
             return
 
-        self.adapter = MicuGPTImage2Adapter(
-            base_url=self.provider_config.base_url,
-            api_key=self.provider_config.api_key,
-            proxy=self.provider_config.proxy,
-        )
-        logger.info("[MicuDemo] 插件加载完成，模型固定为 gpt-image-2-pro")
+        logger.info(f"[MicuDemo] 插件加载完成，已配置 {len(self.provider_configs)} 个 API 分组")
 
     async def terminate(self):
         for task in list(self.tasks):
             task.cancel()
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
-        if self.adapter:
-            await self.adapter.close()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_message(self, event: AstrMessageEvent):
@@ -95,10 +98,6 @@ class MicuImageDemoPlugin(Star):
             )
 
     async def _handle_generate_command(self, event: AstrMessageEvent, message: str):
-        if not self.adapter or not self.provider_config:
-            yield event.plain_result("请先在插件配置中添加 micu_gpt_image2 供应商、Base URL 和 API Key")
-            return
-
         selection = await self.reference_buffer.select_for_command(
             event,
             self._download_image,
@@ -117,8 +116,21 @@ class MicuImageDemoPlugin(Star):
             yield event.plain_result(balance_check.message or "余额不足，禁止生图")
             return
 
-        images = selection.images[: self.provider_config.max_reference_images]
-        if not self._request_size_ok(images):
+        runtime = self._runtime_config_for(event.unified_msg_origin)
+        if runtime is None:
+            yield event.plain_result("请先在用户余额管理中为当前用户配置 API Key 和有效的供应商分组")
+            return
+
+        provider = runtime.provider
+        if selection.has_images and not provider.supports_image_to_image:
+            yield event.plain_result(f"当前分组 {provider.name} 未启用图生图能力")
+            return
+        if not selection.has_images and not provider.supports_text_to_image:
+            yield event.plain_result(f"当前分组 {provider.name} 未启用文生图能力")
+            return
+
+        images = selection.images[: provider.max_reference_images]
+        if not self._request_size_ok(images, provider):
             yield event.plain_result("参考图过大，已超过当前供应商 max_request_size_mb 限制")
             return
 
@@ -132,6 +144,7 @@ class MicuImageDemoPlugin(Star):
             self._generate_and_send(
                 prompt=parsed.command.prompt,
                 unified_msg_origin=event.unified_msg_origin,
+                runtime=runtime,
                 images=images,
                 size=parsed.command.size,
                 source=selection.source,
@@ -168,15 +181,14 @@ class MicuImageDemoPlugin(Star):
         self,
         prompt: str,
         unified_msg_origin: str,
+        runtime: MicuRuntimeConfig,
         images: list[tuple[bytes, str]],
         size: str,
         source: str,
         reply_message_id: str | None,
         requested_count: int,
     ) -> None:
-        if not self.adapter:
-            return
-
+        adapter = self._make_adapter(runtime)
         task_id = hashlib.md5(f"{time.time()}{unified_msg_origin}".encode()).hexdigest()[:8]
         try:
             if images:
@@ -188,9 +200,9 @@ class MicuImageDemoPlugin(Star):
                     )
                     for index, (data, mime) in enumerate(images, start=1)
                 ]
-                generated = await self.adapter.image_to_image(prompt, inputs, size=size)
+                generated = await adapter.image_to_image(prompt, inputs, size=size)
             else:
-                generated = await self.adapter.text_to_image(prompt, size=size, n=requested_count)
+                generated = await adapter.text_to_image(prompt, size=size, n=requested_count)
         except Exception as exc:
             logger.error(f"[MicuDemo] 任务 {task_id} 生成失败: {exc}", exc_info=True)
             await self.context.send_message(
@@ -198,6 +210,8 @@ class MicuImageDemoPlugin(Star):
                 MessageChain().message(f"生成失败: {exc}"),
             )
             return
+        finally:
+            await adapter.close()
 
         file_paths = self._save_generated_images(task_id, generated)
         if not file_paths:
@@ -222,29 +236,53 @@ class MicuImageDemoPlugin(Star):
             MessageChain().message(self.balance_manager.format_usage_message(charge_result)),
         )
 
-    def _load_provider_config(self) -> MicuProviderConfig | None:
+    def _load_provider_configs(self) -> dict[str, MicuProviderConfig]:
         providers = self.config.get("api_providers", [])
         if not isinstance(providers, list):
-            return None
+            return {}
 
+        configs: dict[str, MicuProviderConfig] = {}
         for provider in providers:
             if not isinstance(provider, dict):
                 continue
-            if provider.get("__template_key") != "micu_gpt_image2":
-                continue
 
             base_url = self._clean_base_url(str(provider.get("base_url") or "").strip())
-            api_keys = [
-                str(key).strip()
-                for key in provider.get("api_keys", [])
-                if str(key).strip()
-            ]
-            if not base_url or not api_keys:
-                return None
+            if not base_url:
+                continue
 
-            return MicuProviderConfig(
+            name = self._unique_name(
+                str(provider.get("name") or "").strip() or "API",
+                configs,
+            )
+            supports_text_to_image = self._capability_enabled(
+                provider,
+                "text_to_image_enabled",
+                "文生图",
+            )
+            supports_image_to_image = self._capability_enabled(
+                provider,
+                "image_to_image_enabled",
+                "图生图",
+            )
+
+            configs[name] = MicuProviderConfig(
+                name=name,
                 base_url=base_url,
-                api_key=api_keys[0],
+                text_to_image_endpoint=self._endpoint(
+                    provider.get("text_to_image_endpoint"),
+                    "/v1/images/generations",
+                ),
+                image_to_image_endpoint=self._endpoint(
+                    provider.get("image_to_image_endpoint"),
+                    "/v1/images/edits",
+                ),
+                multi_reference_endpoint=self._endpoint(
+                    provider.get("multi_reference_endpoint")
+                    or provider.get("multi_image_endpoint"),
+                    "/v1/chat/completions",
+                ),
+                supports_text_to_image=supports_text_to_image,
+                supports_image_to_image=supports_image_to_image,
                 proxy=str(provider.get("proxy") or "").strip() or None,
                 max_reference_images=self._positive_int(
                     provider.get("max_reference_images"),
@@ -255,7 +293,50 @@ class MicuImageDemoPlugin(Star):
                     20,
                 ),
             )
-        return None
+        return configs
+
+    def _runtime_config_for(self, umo: str) -> MicuRuntimeConfig | None:
+        user = self.balance_manager.user_config(umo)
+        if user is None:
+            return None
+
+        group = str(user.get("provider_group") or "").strip() or "API"
+        provider = self.provider_configs.get(group)
+        if provider is None and group == "API" and self.provider_configs:
+            provider = next(iter(self.provider_configs.values()))
+        api_key = str(user.get("api_key") or "").strip()
+        if not api_key:
+            api_key = self._legacy_provider_api_key()
+        if provider is None or not api_key:
+            return None
+        return MicuRuntimeConfig(provider=provider, api_key=api_key)
+
+    def _legacy_provider_api_key(self) -> str:
+        providers = self.config.get("api_providers", [])
+        if not isinstance(providers, list):
+            return ""
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            api_keys = provider.get("api_keys", [])
+            if not isinstance(api_keys, list):
+                continue
+            for key in api_keys:
+                value = str(key).strip()
+                if value:
+                    return value
+        return ""
+
+    def _make_adapter(self, runtime: MicuRuntimeConfig) -> MicuGPTImage2Adapter:
+        provider = runtime.provider
+        return MicuGPTImage2Adapter(
+            base_url=provider.base_url,
+            api_key=runtime.api_key,
+            text_to_image_endpoint=provider.text_to_image_endpoint,
+            image_to_image_endpoint=provider.image_to_image_endpoint,
+            multi_image_endpoint=provider.multi_reference_endpoint,
+            proxy=provider.proxy,
+        )
 
     async def _download_image(self, url: str) -> tuple[bytes, str] | None:
         try:
@@ -286,6 +367,32 @@ class MicuImageDemoPlugin(Star):
         if index != -1:
             url = url[:index]
         return url.rstrip("/")
+
+    def _unique_name(self, base_name: str, existing: dict[str, Any]) -> str:
+        name = base_name
+        index = 1
+        while name in existing:
+            name = f"{base_name}{index}"
+            index += 1
+        return name
+
+    def _capability_enabled(
+        self,
+        provider: dict[str, Any],
+        bool_key: str,
+        legacy_name: str,
+    ) -> bool:
+        if bool_key in provider:
+            return bool(provider.get(bool_key))
+
+        legacy = provider.get("capability_options")
+        if isinstance(legacy, list):
+            return legacy_name in {str(item).strip() for item in legacy}
+        return True
+
+    def _endpoint(self, value: Any, default: str) -> str:
+        endpoint = str(value or "").strip()
+        return endpoint or default
 
     def _positive_int(self, value: Any, default: int) -> int:
         try:
@@ -361,11 +468,13 @@ class MicuImageDemoPlugin(Star):
                     parts.append(str(text))
         return "".join(parts)
 
-    def _request_size_ok(self, images: list[tuple[bytes, str]]) -> bool:
-        if not self.provider_config:
-            return False
+    def _request_size_ok(
+        self,
+        images: list[tuple[bytes, str]],
+        provider: MicuProviderConfig,
+    ) -> bool:
         total = sum(len(data) for data, _ in images)
-        return total <= self.provider_config.max_request_size_mb * 1024 * 1024
+        return total <= provider.max_request_size_mb * 1024 * 1024
 
     def _save_generated_images(self, task_id: str, images: list[bytes]) -> list[str]:
         paths: list[str] = []
