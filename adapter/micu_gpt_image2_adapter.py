@@ -63,6 +63,20 @@ class MicuGPTImage2Adapter:
         prompt: str,
         images: list[MicuImageInput] | list[bytes],
     ) -> list[bytes]:
+        normalized = [
+            self._normalize_image_input(image, index)
+            for index, image in enumerate(images)
+        ]
+
+        if len(normalized) <= 1:
+            return await self._post_edits(prompt, normalized[:1])
+        return await self._post_chat_with_images(prompt, normalized)
+
+    async def _post_edits(
+        self,
+        prompt: str,
+        images: list[MicuImageInput],
+    ) -> list[bytes]:
         aiohttp = self._aiohttp()
         form = aiohttp.FormData()
         form.add_field("model", MODEL)
@@ -71,16 +85,47 @@ class MicuGPTImage2Adapter:
         form.add_field("size", SIZE)
         form.add_field("response_format", RESPONSE_FORMAT)
 
-        for index, image in enumerate(images):
-            image_input = self._normalize_image_input(image, index)
+        if images:
+            image = images[0]
             form.add_field(
-                "image[]",
-                image_input.data,
-                filename=image_input.filename,
-                content_type=image_input.content_type,
+                "image",
+                image.data,
+                filename=image.filename,
+                content_type=image.content_type,
             )
 
         return await self._post_form("/v1/images/edits", form)
+
+    async def _post_chat_with_images(
+        self,
+        prompt: str,
+        images: list[MicuImageInput],
+    ) -> list[bytes]:
+        aiohttp = self._aiohttp()
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+
+        for image in images:
+            data_url = self._image_to_data_url(image)
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url},
+                }
+            )
+
+        payload = {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": content}],
+        }
+
+        async with self._session_or_new().post(
+            f"{self.base_url}/v1/chat/completions",
+            headers={**self._headers(), "Content-Type": "application/json"},
+            json=payload,
+            proxy=self.proxy,
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+        ) as response:
+            return await self._handle_response(response)
 
     async def _post_json(self, path: str, payload: dict[str, Any]) -> list[bytes]:
         headers = self._headers()
@@ -279,6 +324,10 @@ class MicuGPTImage2Adapter:
         if isinstance(image, MicuImageInput):
             return image
         return MicuImageInput(data=image, filename=f"image_{index}.png")
+
+    def _image_to_data_url(self, image: MicuImageInput) -> str:
+        encoded = base64.b64encode(image.data).decode("utf-8")
+        return f"data:{image.content_type};base64,{encoded}"
 
     def _session_or_new(self) -> aiohttp.ClientSession:
         aiohttp = self._aiohttp()
