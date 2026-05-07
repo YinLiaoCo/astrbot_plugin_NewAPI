@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
 
 
 MODEL = "gpt-image-2-pro"
-SIZE = "1024x1024"
+DEFAULT_SIZE = "1024x1024"
 RESPONSE_FORMAT = "b64_json"
 
 
@@ -48,12 +49,12 @@ class MicuGPTImage2Adapter:
             await self._session.close()
         self._session = None
 
-    async def text_to_image(self, prompt: str) -> list[bytes]:
+    async def text_to_image(self, prompt: str, size: str = DEFAULT_SIZE, n: int = 1) -> list[bytes]:
         payload = {
             "model": MODEL,
             "prompt": prompt,
-            "n": 1,
-            "size": SIZE,
+            "n": n,
+            "size": size,
             "response_format": RESPONSE_FORMAT,
         }
         return await self._post_json("/v1/images/generations", payload)
@@ -62,6 +63,7 @@ class MicuGPTImage2Adapter:
         self,
         prompt: str,
         images: list[MicuImageInput] | list[bytes],
+        size: str = DEFAULT_SIZE,
     ) -> list[bytes]:
         normalized = [
             self._normalize_image_input(image, index)
@@ -69,20 +71,21 @@ class MicuGPTImage2Adapter:
         ]
 
         if len(normalized) <= 1:
-            return await self._post_edits(prompt, normalized[:1])
+            return await self._post_edits(prompt, normalized[:1], size)
         return await self._post_chat_with_images(prompt, normalized)
 
     async def _post_edits(
         self,
         prompt: str,
         images: list[MicuImageInput],
+        size: str,
     ) -> list[bytes]:
         aiohttp = self._aiohttp()
         form = aiohttp.FormData()
         form.add_field("model", MODEL)
         form.add_field("prompt", prompt)
         form.add_field("n", "1")
-        form.add_field("size", SIZE)
+        form.add_field("size", size)
         form.add_field("response_format", RESPONSE_FORMAT)
 
         if images:
@@ -185,7 +188,7 @@ class MicuGPTImage2Adapter:
         if not images:
             images.extend(await self._extract_from_text(raw_text))
 
-        return images
+        return self._dedupe_images(images)
 
     async def _extract_from_json(self, value: Any) -> list[bytes]:
         images: list[bytes] = []
@@ -258,6 +261,17 @@ class MicuGPTImage2Adapter:
             results.extend(re.findall(r"(?:[A-Za-z0-9+/]{4}){50,}(?:==|=)?", text))
 
         return results
+
+    def _dedupe_images(self, images: list[bytes]) -> list[bytes]:
+        deduped: list[bytes] = []
+        seen: set[str] = set()
+        for image in images:
+            digest = hashlib.sha256(image).hexdigest()
+            if digest in seen:
+                continue
+            seen.add(digest)
+            deduped.append(image)
+        return deduped
 
     def _decode_base64_like(self, value: str) -> bytes | None:
         candidate = value.strip()

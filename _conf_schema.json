@@ -54,5 +54,44 @@
         }
       }
     }
+  },
+  "balance_users": {
+    "type": "template_list",
+    "description": "用户余额管理",
+    "hint": "配置允许使用生图的会话 UMO 与充值额度",
+    "templates": {
+      "user": {
+        "name": "余额用户",
+        "items": {
+          "enabled": {
+            "description": "启用用户",
+            "type": "bool",
+            "default": true
+          },
+          "umo": {
+            "description": "用户 UMO",
+            "type": "string",
+            "default": ""
+          },
+          "balance_display": {
+            "description": "用户余额",
+            "type": "string",
+            "default": "0",
+            "hint": "展示用字段；运行时余额以插件数据文件为准"
+          },
+          "cost_per_image": {
+            "description": "生图单次额度",
+            "type": "float",
+            "default": 0.1,
+            "hint": "每生成 1 张图扣除的额度"
+          },
+          "add_amount": {
+            "description": "添加金额",
+            "type": "float",
+            "default": 0
+          }
+        }
+      }
+    }
   }
 }

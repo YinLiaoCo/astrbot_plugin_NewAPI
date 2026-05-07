@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -15,7 +16,7 @@ from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.io import download_image_by_url
 
 from .adapter import MicuGPTImage2Adapter, MicuImageInput
-from .core import ReferenceBuffer, parse_generate_command
+from .core import BalanceManager, ReferenceBuffer, parse_generate_command
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class MicuImageDemoPlugin(Star):
         self.tasks: set[asyncio.Task] = set()
 
         self.data_dir = Path(StarTools.get_data_dir()) / "astrbot_plugin_NewAPI"
+        self.balance_manager = BalanceManager(self.data_dir, self.config)
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -107,13 +109,21 @@ class MicuImageDemoPlugin(Star):
         )
         parsed = parse_generate_command(message, selection.has_images)
         if not parsed.ok or not parsed.command:
-            yield event.plain_result(parsed.error or "格式错误，请使用 /生图 尺寸: 1k 提示词")
+            yield event.plain_result(parsed.error or "格式错误，请使用 /生图 4:3 1k 提示词")
+            return
+
+        balance_check = self.balance_manager.precheck(event.unified_msg_origin, parsed.command.n)
+        if not balance_check.ok:
+            yield event.plain_result(balance_check.message or "余额不足，禁止生图")
             return
 
         images = selection.images[: self.provider_config.max_reference_images]
         if not self._request_size_ok(images):
             yield event.plain_result("参考图过大，已超过当前供应商 max_request_size_mb 限制")
             return
+
+        if parsed.command.warning:
+            yield event.plain_result(parsed.command.warning)
 
         yield event.plain_result("正在生图中，可以继续写提示词")
 
@@ -123,8 +133,10 @@ class MicuImageDemoPlugin(Star):
                 prompt=parsed.command.prompt,
                 unified_msg_origin=event.unified_msg_origin,
                 images=images,
+                size=parsed.command.size,
                 source=selection.source,
                 reply_message_id=self._get_message_id(event),
+                requested_count=parsed.command.n,
             )
         )
         self.tasks.add(task)
@@ -137,11 +149,15 @@ class MicuImageDemoPlugin(Star):
                 return "reset"
             if text.startswith(f"{prefix}生图"):
                 return "generate"
+            if text.startswith(f"{prefix}批量生成"):
+                return "generate"
 
         # Some adapters may remove the wake prefix before plugins see message_str.
         if text == "重置" or text.startswith("重置 "):
             return "reset"
         if text == "生图" or text.startswith("生图 "):
+            return "generate"
+        if text == "批量生成" or text.startswith("批量生成 "):
             return "generate"
         return None
 
@@ -153,8 +169,10 @@ class MicuImageDemoPlugin(Star):
         prompt: str,
         unified_msg_origin: str,
         images: list[tuple[bytes, str]],
+        size: str,
         source: str,
         reply_message_id: str | None,
+        requested_count: int,
     ) -> None:
         if not self.adapter:
             return
@@ -170,9 +188,9 @@ class MicuImageDemoPlugin(Star):
                     )
                     for index, (data, mime) in enumerate(images, start=1)
                 ]
-                generated = await self.adapter.image_to_image(prompt, inputs)
+                generated = await self.adapter.image_to_image(prompt, inputs, size=size)
             else:
-                generated = await self.adapter.text_to_image(prompt)
+                generated = await self.adapter.text_to_image(prompt, size=size, n=requested_count)
         except Exception as exc:
             logger.error(f"[MicuDemo] 任务 {task_id} 生成失败: {exc}", exc_info=True)
             await self.context.send_message(
@@ -195,6 +213,14 @@ class MicuImageDemoPlugin(Star):
             f"尝试引用={bool(reply_message_id)}，引用成功={used_reply}"
         )
         await self.context.send_message(unified_msg_origin, chain)
+        charge_result = self.balance_manager.charge(
+            unified_msg_origin,
+            len(file_paths),
+        )
+        await self.context.send_message(
+            unified_msg_origin,
+            MessageChain().message(self.balance_manager.format_usage_message(charge_result)),
+        )
 
     def _load_provider_config(self) -> MicuProviderConfig | None:
         providers = self.config.get("api_providers", [])
@@ -207,7 +233,7 @@ class MicuImageDemoPlugin(Star):
             if provider.get("__template_key") != "micu_gpt_image2":
                 continue
 
-            base_url = str(provider.get("base_url") or "").strip()
+            base_url = self._clean_base_url(str(provider.get("base_url") or "").strip())
             api_keys = [
                 str(key).strip()
                 for key in provider.get("api_keys", [])
@@ -220,22 +246,23 @@ class MicuImageDemoPlugin(Star):
                 base_url=base_url,
                 api_key=api_keys[0],
                 proxy=str(provider.get("proxy") or "").strip() or None,
-                max_reference_images=max(
+                max_reference_images=self._positive_int(
+                    provider.get("max_reference_images"),
                     1,
-                    int(provider.get("max_reference_images") or 1),
                 ),
-                max_request_size_mb=max(
-                    1,
-                    int(provider.get("max_request_size_mb") or 20),
+                max_request_size_mb=self._positive_int(
+                    provider.get("max_request_size_mb"),
+                    20,
                 ),
             )
         return None
 
     async def _download_image(self, url: str) -> tuple[bytes, str] | None:
         try:
-            clean_url = url[7:] if url.startswith("file://") else url
-            path = Path(clean_url)
-            if path.exists() and path.is_file():
+            path = self._local_path_from_image_ref(url)
+            if path is not None:
+                if not path.exists() or not path.is_file():
+                    return None
                 data = path.read_bytes()
             else:
                 file_name = f"ref_{hashlib.md5(url.encode()).hexdigest()[:12]}"
@@ -251,6 +278,44 @@ class MicuImageDemoPlugin(Star):
         except Exception as exc:
             logger.warning(f"[MicuDemo] 提取参考图失败: {exc}")
             return None
+
+    def _clean_base_url(self, base_url: str) -> str:
+        url = base_url.rstrip("/")
+        marker = "/v1"
+        index = url.find(marker)
+        if index != -1:
+            url = url[:index]
+        return url.rstrip("/")
+
+    def _positive_int(self, value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(1, parsed)
+
+    def _local_path_from_image_ref(self, image_ref: str) -> Path | None:
+        value = image_ref.strip()
+        if not value:
+            return None
+
+        plain_path = Path(value)
+        if plain_path.exists():
+            return plain_path
+
+        parsed = urlparse(value)
+        if parsed.scheme != "file":
+            return None
+
+        path_text = unquote(parsed.path or "")
+        if parsed.netloc:
+            if len(parsed.netloc) == 2 and parsed.netloc[1] == ":":
+                path_text = f"{parsed.netloc}{path_text}"
+            else:
+                path_text = f"//{parsed.netloc}{path_text}"
+        if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":":
+            path_text = path_text[1:]
+        return Path(path_text)
 
     def _get_event_text(self, event: AstrMessageEvent) -> str:
         candidates = [
