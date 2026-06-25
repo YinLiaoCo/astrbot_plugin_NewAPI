@@ -13,9 +13,10 @@ if TYPE_CHECKING:
     import aiohttp
 
 
-MODEL = "gpt-image-2-pro"
+MODEL = "gpt-image-2"
 DEFAULT_SIZE = "1024x1024"
-RESPONSE_FORMAT = "b64_json"
+DEFAULT_QUALITY = "auto"
+OUTPUT_FORMAT = "png"
 
 
 @dataclass(frozen=True)
@@ -26,7 +27,7 @@ class MicuImageInput:
 
 
 class MicuGPTImage2Adapter:
-    """Demo adapter for Micu gpt-image-2-pro image API."""
+    """Adapter for the official OpenAI gpt-image-2 Image API."""
 
     def __init__(
         self,
@@ -55,13 +56,22 @@ class MicuGPTImage2Adapter:
             await self._session.close()
         self._session = None
 
-    async def text_to_image(self, prompt: str, size: str = DEFAULT_SIZE, n: int = 1) -> list[bytes]:
+    async def text_to_image(
+        self,
+        prompt: str,
+        size: str = DEFAULT_SIZE,
+        n: int = 1,
+        *,
+        model: str = MODEL,
+        quality: str = DEFAULT_QUALITY,
+    ) -> list[bytes]:
         payload = {
-            "model": MODEL,
+            "model": self._clean_model(model),
             "prompt": prompt,
             "n": n,
             "size": size,
-            "response_format": RESPONSE_FORMAT,
+            "quality": self._clean_quality(quality),
+            "output_format": OUTPUT_FORMAT,
         }
         return await self._post_json(self.text_to_image_endpoint, payload)
 
@@ -70,71 +80,43 @@ class MicuGPTImage2Adapter:
         prompt: str,
         images: list[MicuImageInput] | list[bytes],
         size: str = DEFAULT_SIZE,
+        *,
+        model: str = MODEL,
+        quality: str = DEFAULT_QUALITY,
     ) -> list[bytes]:
         normalized = [
             self._normalize_image_input(image, index)
             for index, image in enumerate(images)
         ]
 
-        if len(normalized) <= 1:
-            return await self._post_edits(prompt, normalized[:1], size)
-        return await self._post_chat_with_images(prompt, normalized)
+        return await self._post_edits(prompt, normalized, size, model, quality)
 
     async def _post_edits(
         self,
         prompt: str,
         images: list[MicuImageInput],
         size: str,
+        model: str,
+        quality: str,
     ) -> list[bytes]:
         aiohttp = self._aiohttp()
         form = aiohttp.FormData()
-        form.add_field("model", MODEL)
+        form.add_field("model", self._clean_model(model))
         form.add_field("prompt", prompt)
         form.add_field("n", "1")
         form.add_field("size", size)
-        form.add_field("response_format", RESPONSE_FORMAT)
+        form.add_field("quality", self._clean_quality(quality))
+        form.add_field("output_format", OUTPUT_FORMAT)
 
-        if images:
-            image = images[0]
+        for image in images:
             form.add_field(
-                "image",
+                "image[]",
                 image.data,
                 filename=image.filename,
                 content_type=image.content_type,
             )
 
         return await self._post_form(self.image_to_image_endpoint, form)
-
-    async def _post_chat_with_images(
-        self,
-        prompt: str,
-        images: list[MicuImageInput],
-    ) -> list[bytes]:
-        aiohttp = self._aiohttp()
-        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-
-        for image in images:
-            data_url = self._image_to_data_url(image)
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": data_url},
-                }
-            )
-
-        payload = {
-            "model": MODEL,
-            "messages": [{"role": "user", "content": content}],
-        }
-
-        async with self._session_or_new().post(
-            self._url_for(self.multi_image_endpoint),
-            headers={**self._headers(), "Content-Type": "application/json"},
-            json=payload,
-            proxy=self.proxy,
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
-        ) as response:
-            return await self._handle_response(response)
 
     async def _post_json(self, path: str, payload: dict[str, Any]) -> list[bytes]:
         headers = self._headers()
@@ -172,19 +154,19 @@ class MicuGPTImage2Adapter:
         raw_text = await response.text()
         if response.status < 200 or response.status >= 300:
             raise RuntimeError(
-                f"Micu API error {response.status}: {self._response_preview(raw_text)}"
+                f"OpenAI API error {response.status}: {self._response_preview(raw_text)}"
             )
 
         try:
             images = await self.parse_response(raw_text)
         except Exception as exc:
             raise RuntimeError(
-                "Micu API response image parsing failed. "
+                "OpenAI API response image parsing failed. "
                 f"Reason: {exc}. Raw response preview: {self._response_preview(raw_text)}"
             ) from exc
         if not images:
             raise RuntimeError(
-                "Micu API response did not contain an image. "
+                "OpenAI API response did not contain an image. "
                 f"Raw response preview: {self._response_preview(raw_text)}"
             )
         return images
@@ -305,7 +287,7 @@ class MicuGPTImage2Adapter:
             image = self._decode_base64_like(value)
             if image:
                 return image
-            raise ValueError("Invalid data URL image in Micu API response")
+            raise ValueError("Invalid data URL image in OpenAI API response")
 
         parsed = urlparse(value)
         if parsed.scheme in {"http", "https"}:
@@ -353,9 +335,12 @@ class MicuGPTImage2Adapter:
             return image
         return MicuImageInput(data=image, filename=f"image_{index}.png")
 
-    def _image_to_data_url(self, image: MicuImageInput) -> str:
-        encoded = base64.b64encode(image.data).decode("utf-8")
-        return f"data:{image.content_type};base64,{encoded}"
+    def _clean_model(self, model: str) -> str:
+        return str(model or "").strip() or MODEL
+
+    def _clean_quality(self, quality: str) -> str:
+        value = str(quality or "").strip().lower()
+        return value if value in {"auto", "low", "medium", "high"} else DEFAULT_QUALITY
 
     def _session_or_new(self) -> aiohttp.ClientSession:
         aiohttp = self._aiohttp()
@@ -378,6 +363,6 @@ class MicuGPTImage2Adapter:
             import aiohttp
         except ModuleNotFoundError as exc:
             raise RuntimeError(
-                "aiohttp is required to call the Micu image API"
+                "aiohttp is required to call the OpenAI image API"
             ) from exc
         return aiohttp

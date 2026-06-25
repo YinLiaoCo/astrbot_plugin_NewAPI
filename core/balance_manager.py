@@ -16,6 +16,9 @@ class BalanceUser:
     cost_per_image: float
     provider_group: str
     api_key: str
+    image_model: str
+    image_quality: str
+    image_size: str
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,9 @@ class BalanceManager:
                 cost_per_image=cost,
                 provider_group=provider_group,
                 api_key=api_key,
+                image_model=self._string(entry.get("image_model"), "gpt-image-2"),
+                image_quality=self._image_quality(entry.get("image_quality")),
+                image_size=self._string(entry.get("image_size"), ""),
             )
 
         self._users = users
@@ -143,6 +149,9 @@ class BalanceManager:
             "enabled": user.enabled,
             "provider_group": user.provider_group,
             "api_key": user.api_key,
+            "image_model": user.image_model,
+            "image_quality": user.image_quality,
+            "image_size": user.image_size,
             "cost_per_image": user.cost_per_image,
         }
 
@@ -242,6 +251,14 @@ class BalanceManager:
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    def _string(self, value: Any, default: str) -> str:
+        text = str(value or "").strip()
+        return text or default
+
+    def _image_quality(self, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        return text if text in {"auto", "low", "medium", "high"} else "auto"
 
     def _round_amount(self, value: float) -> float:
         return round(float(value), 6)

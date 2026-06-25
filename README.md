@@ -1,6 +1,6 @@
 # astrbot_plugin_NewAPI
 
-米醋 `gpt-image-2-pro` 最小 Demo 插件，用于验证：
+OpenAI `gpt-image-2` 最小 Demo 插件，用于验证：
 
 - `/生图 4:3 1k 提示词` 文生图。
 - `/批量生成 3 4:3 1k 提示词` 批量文生图。
@@ -20,23 +20,26 @@
 - `text_to_image_enabled`: 是否启用文生图。
 - `text_to_image_endpoint`: 文生图接口地址。
 - `image_to_image_enabled`: 是否启用图生图。
-- `image_to_image_endpoint`: 单参考图图生图接口地址。
-- `multi_reference_endpoint`: 多参考图接口地址。
+- `image_to_image_endpoint`: 图生图接口地址，官方 gpt-image-2 单图和多图参考都使用该接口。
+- `multi_reference_endpoint`: 兼容旧配置保留；官方 gpt-image-2 多参考图同样使用 `/v1/images/edits`。
 - `max_reference_images`: Demo 默认 `1`。
 - `max_request_size_mb`: Demo 默认 `20`。
 
-在插件配置中新增 `balance_users` 余额用户：
+在插件配置中新增 `balance_users` 用户：
 
 - `name`: 用户名称。
 - `umo`: 允许使用生图的会话 UMO。
 - `enabled`: 关闭后该 UMO 禁止生图。
 - `provider_group`: 选择供应商分组，填写 API 供应商配置中的分组名称。
 - `api_key`: 该用户使用的一条 API Key。
+- `image_model`: 生图模型，例如 `gpt-image-2`。
+- `image_quality`: 生图质量，可选 `auto` / `low` / `medium` / `high`。
+- `image_size`: 图像分辨率，留空使用命令里的比例和档位，也可填 `auto` 或 `1024x1024` 等官方尺寸。
 - `cost_per_image`: 每生成 1 张图扣除的额度。
 - `add_amount`: 充值额度；插件加载或检查余额时会写入真实余额并归零。
 - `balance_display`: 只作展示，真实余额以插件数据目录中的 `balances.json` 为准。
 
-模型固定为 `gpt-image-2-pro`，Demo 不调用 AstrBot 对话模型。
+模型固定为 `gpt-image-2`，Demo 不调用 AstrBot 对话模型。
 
 ## 命令
 

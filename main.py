@@ -39,9 +39,9 @@ class MicuRuntimeConfig:
     api_key: str
 
 
-@register("astrbot_plugin_NewAPI", "cl", "米醋 gpt-image-2-pro Demo", "0.1.0")
+@register("astrbot_plugin_NewAPI", "cl", "OpenAI gpt-image-2 Demo", "0.1.0")
 class MicuImageDemoPlugin(Star):
-    """Minimal demo for Micu gpt-image-2-pro generation."""
+    """Minimal demo for OpenAI gpt-image-2 generation."""
 
     def __init__(self, context: Context, config: Any):
         super().__init__(context)
@@ -58,10 +58,10 @@ class MicuImageDemoPlugin(Star):
 
     async def initialize(self):
         if not self.provider_configs:
-            logger.warning("[MicuDemo] 未配置可用 API 供应商，/生图 将不可用")
+            logger.warning("[ImageDemo] 未配置可用 API 供应商，/生图 将不可用")
             return
 
-        logger.info(f"[MicuDemo] 插件加载完成，已配置 {len(self.provider_configs)} 个 API 分组")
+        logger.info(f"[ImageDemo] 插件加载完成，已配置 {len(self.provider_configs)} 个 API 分组")
 
     async def terminate(self):
         for task in list(self.tasks):
@@ -94,7 +94,7 @@ class MicuImageDemoPlugin(Star):
         )
         if count:
             logger.info(
-                f"[MicuDemo] 已缓存 {count} 张参考图，UMO={event.unified_msg_origin}"
+                f"[ImageDemo] 已缓存 {count} 张参考图，UMO={event.unified_msg_origin}"
             )
 
     async def _handle_generate_command(self, event: AstrMessageEvent, message: str):
@@ -103,7 +103,7 @@ class MicuImageDemoPlugin(Star):
             self._download_image,
         )
         logger.info(
-            f"[MicuDemo] 收到生图命令，UMO={event.unified_msg_origin}，"
+            f"[ImageDemo] 收到生图命令，UMO={event.unified_msg_origin}，"
             f"文本={message!r}，参考图来源={selection.source}，参考图数量={len(selection.images)}"
         )
         parsed = parse_generate_command(message, selection.has_images)
@@ -120,6 +120,10 @@ class MicuImageDemoPlugin(Star):
         if runtime is None:
             yield event.plain_result("请先在用户余额管理中为当前用户配置 API Key 和有效的供应商分组")
             return
+        user = balance_check.user
+        image_model = user.image_model if user else "gpt-image-2"
+        image_quality = user.image_quality if user else "auto"
+        image_size = self._configured_image_size(user.image_size if user else "", parsed.command.size)
 
         provider = runtime.provider
         if selection.has_images and not provider.supports_image_to_image:
@@ -146,7 +150,9 @@ class MicuImageDemoPlugin(Star):
                 unified_msg_origin=event.unified_msg_origin,
                 runtime=runtime,
                 images=images,
-                size=parsed.command.size,
+                size=image_size,
+                model=image_model,
+                quality=image_quality,
                 source=selection.source,
                 reply_message_id=self._get_message_id(event),
                 requested_count=parsed.command.n,
@@ -184,6 +190,8 @@ class MicuImageDemoPlugin(Star):
         runtime: MicuRuntimeConfig,
         images: list[tuple[bytes, str]],
         size: str,
+        model: str,
+        quality: str,
         source: str,
         reply_message_id: str | None,
         requested_count: int,
@@ -200,11 +208,23 @@ class MicuImageDemoPlugin(Star):
                     )
                     for index, (data, mime) in enumerate(images, start=1)
                 ]
-                generated = await adapter.image_to_image(prompt, inputs, size=size)
+                generated = await adapter.image_to_image(
+                    prompt,
+                    inputs,
+                    size=size,
+                    model=model,
+                    quality=quality,
+                )
             else:
-                generated = await adapter.text_to_image(prompt, size=size, n=requested_count)
+                generated = await adapter.text_to_image(
+                    prompt,
+                    size=size,
+                    n=requested_count,
+                    model=model,
+                    quality=quality,
+                )
         except Exception as exc:
-            logger.error(f"[MicuDemo] 任务 {task_id} 生成失败: {exc}", exc_info=True)
+            logger.error(f"[ImageDemo] 任务 {task_id} 生成失败: {exc}", exc_info=True)
             await self.context.send_message(
                 unified_msg_origin,
                 MessageChain().message(f"生成失败: {exc}"),
@@ -223,7 +243,7 @@ class MicuImageDemoPlugin(Star):
 
         chain, used_reply = self._build_result_chain(file_paths, reply_message_id)
         logger.info(
-            f"[MicuDemo] 任务 {task_id} 发送图片，参考图来源={source}，"
+            f"[ImageDemo] 任务 {task_id} 发送图片，参考图来源={source}，"
             f"尝试引用={bool(reply_message_id)}，引用成功={used_reply}"
         )
         await self.context.send_message(unified_msg_origin, chain)
@@ -357,7 +377,7 @@ class MicuImageDemoPlugin(Star):
                 return None
             return data, self._detect_mime_type(data)
         except Exception as exc:
-            logger.warning(f"[MicuDemo] 提取参考图失败: {exc}")
+            logger.warning(f"[ImageDemo] 提取参考图失败: {exc}")
             return None
 
     def _clean_base_url(self, base_url: str) -> str:
@@ -476,6 +496,18 @@ class MicuImageDemoPlugin(Star):
         total = sum(len(data) for data, _ in images)
         return total <= provider.max_request_size_mb * 1024 * 1024
 
+    def _configured_image_size(self, configured_size: str, fallback: str) -> str:
+        value = str(configured_size or "").strip().lower()
+        if not value:
+            return fallback
+        if value in {"auto"}:
+            return "auto"
+        if "x" in value:
+            left, _, right = value.partition("x")
+            if left.isdigit() and right.isdigit():
+                return f"{int(left)}x{int(right)}"
+        return fallback
+
     def _save_generated_images(self, task_id: str, images: list[bytes]) -> list[str]:
         paths: list[str] = []
         for index, image in enumerate(images, start=1):
@@ -504,7 +536,7 @@ class MicuImageDemoPlugin(Star):
             try:
                 reply = Comp.Reply(**kwargs)
             except Exception as exc:
-                logger.debug(f"[MicuDemo] Reply 构造失败 {kwargs}: {exc}")
+                logger.debug(f"[ImageDemo] Reply 构造失败 {kwargs}: {exc}")
                 continue
 
             for attr in ("chain", "message_chain", "messages"):
@@ -513,10 +545,10 @@ class MicuImageDemoPlugin(Star):
                     items.insert(0, reply)
                     return True
 
-            logger.info("[MicuDemo] MessageChain 未暴露可插入 Reply 的列表，退化为普通发图")
+            logger.info("[ImageDemo] MessageChain 未暴露可插入 Reply 的列表，退化为普通发图")
             return False
 
-        logger.info("[MicuDemo] 当前 Reply 组件构造方式不可用，退化为普通发图")
+        logger.info("[ImageDemo] 当前 Reply 组件构造方式不可用，退化为普通发图")
         return False
 
     def _get_message_id(self, event: AstrMessageEvent) -> str | None:

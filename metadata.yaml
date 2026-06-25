@@ -1,6 +1,6 @@
 name: astrbot_plugin_NewAPI
-display_name: 米醋 gpt-image-2-pro Demo
-desc: 最小验证米醋 gpt-image-2-pro 文生图、图生图和会话参考图缓存。
+display_name: OpenAI gpt-image-2 Demo
+desc: 最小验证 OpenAI gpt-image-2 文生图、图生图和会话参考图缓存。
 version: v0.1.0
 author: cl
 repo: ""

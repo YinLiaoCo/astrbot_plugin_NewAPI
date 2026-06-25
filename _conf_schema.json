@@ -45,13 +45,13 @@
             "description": "图生图接口地址",
             "type": "string",
             "default": "/v1/images/edits",
-            "hint": "仅在启用图生图时生效，用于单张参考图。"
+            "hint": "仅在启用图生图时生效，官方 gpt-image-2 单图和多图参考都使用 image[] 提交到该接口。"
           },
           "multi_reference_endpoint": {
             "description": "多参考图接口地址",
             "type": "string",
-            "default": "/v1/chat/completions",
-            "hint": "仅在启用图生图时生效，用于多张参考图；如果你的模型不单独区分多参考图，可保持默认。"
+            "default": "/v1/images/edits",
+            "hint": "兼容旧配置保留；官方 gpt-image-2 多参考图同样使用 /v1/images/edits。"
           },
           "proxy": {
             "description": "代理地址",
@@ -114,6 +114,29 @@
             "type": "string",
             "default": "",
             "hint": "每个用户只能配置一条 API Key。"
+          },
+          "image_model": {
+            "description": "生图模型",
+            "type": "string",
+            "default": "gpt-image-2",
+            "hint": "填写 OpenAI 图像模型名称，例如 gpt-image-2"
+          },
+          "image_quality": {
+            "description": "生图质量",
+            "type": "string",
+            "options": [
+              "auto",
+              "low",
+              "medium",
+              "high"
+            ],
+            "default": "auto"
+          },
+          "image_size": {
+            "description": "图像分辨率",
+            "type": "string",
+            "default": "",
+            "hint": "留空时使用命令里的比例和档位；也可填写 auto、1024x1024、1536x1024、1024x1536 等官方支持尺寸"
           },
           "balance_display": {
             "description": "用户余额",
