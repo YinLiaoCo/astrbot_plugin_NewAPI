@@ -16,7 +16,7 @@ from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.io import download_image_by_url
 
 from .adapter import MicuGPTImage2Adapter, MicuImageInput
-from .core import BalanceManager, ReferenceBuffer, parse_generate_command
+from .core import BalanceManager, ReferenceBuffer, parse_prompt_message
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,7 @@ class MicuImageDemoPlugin(Star):
         self.reference_buffer = ReferenceBuffer()
         self.provider_configs = self._load_provider_configs()
         self.tasks: set[asyncio.Task] = set()
+        self.generation_sessions: set[str] = set()
 
         self.data_dir = Path(StarTools.get_data_dir()) / "astrbot_plugin_NewAPI"
         self.balance_manager = BalanceManager(self.data_dir, self.config)
@@ -77,13 +78,51 @@ class MicuImageDemoPlugin(Star):
 
         message = self._get_event_text(event)
         command = self._parse_demo_command(message)
+        unified_msg_origin = event.unified_msg_origin
 
         if command == "reset":
-            self.reference_buffer.clear(event.unified_msg_origin)
+            self.reference_buffer.clear(unified_msg_origin)
             yield event.plain_result("已重置当前会话参考图")
             return
 
+        if command == "start_generation":
+            self.generation_sessions.add(unified_msg_origin)
+            count = await self.reference_buffer.cache_plain_message_images(
+                event,
+                self._download_image,
+            )
+            if count:
+                logger.info(
+                    f"[ImageDemo] 已缓存 {count} 张参考图，UMO={event.unified_msg_origin}"
+                )
+            yield event.plain_result("已开启生图功能，发送提示词即可生图，发送 /结束生图 退出")
+            return
+
+        if command == "end_generation":
+            self.generation_sessions.discard(unified_msg_origin)
+            self.reference_buffer.clear(unified_msg_origin)
+            yield event.plain_result("已结束生图功能")
+            return
+
+        if command == "invalid_generate":
+            if unified_msg_origin in self.generation_sessions:
+                yield event.plain_result("生图功能已开启，请直接发送提示词，不要带 /生图")
+            else:
+                yield event.plain_result("请发送 /生图 开启生图功能，然后直接发送提示词")
+            return
+
         if command == "generate":
+            if unified_msg_origin not in self.generation_sessions:
+                yield event.plain_result("请先发送 /生图 开启生图功能")
+                return
+            async for result in self._handle_generate_command(event, message):
+                yield result
+            return
+
+        if unified_msg_origin not in self.generation_sessions:
+            return
+
+        if message.strip():
             async for result in self._handle_generate_command(event, message):
                 yield result
             return
@@ -106,9 +145,9 @@ class MicuImageDemoPlugin(Star):
             f"[ImageDemo] 收到生图命令，UMO={event.unified_msg_origin}，"
             f"文本={message!r}，参考图来源={selection.source}，参考图数量={len(selection.images)}"
         )
-        parsed = parse_generate_command(message, selection.has_images)
+        parsed = parse_prompt_message(message, selection.has_images)
         if not parsed.ok or not parsed.command:
-            yield event.plain_result(parsed.error or "格式错误，请使用 /生图 4:3 1k 提示词")
+            yield event.plain_result(parsed.error or "请发送提示词，或发送 /结束生图 退出")
             return
 
         balance_check = self.balance_manager.precheck(event.unified_msg_origin, parsed.command.n)
@@ -163,21 +202,31 @@ class MicuImageDemoPlugin(Star):
 
     def _parse_demo_command(self, message: str) -> str | None:
         text = message.strip()
-        for prefix in ("/", "／"):
-            if text.startswith(f"{prefix}重置"):
-                return "reset"
-            if text.startswith(f"{prefix}生图"):
-                return "generate"
-            if text.startswith(f"{prefix}批量生成"):
-                return "generate"
+        if self._command_remainder(text, "结束生图") is not None:
+            return "end_generation"
 
-        # Some adapters may remove the wake prefix before plugins see message_str.
-        if text == "重置" or text.startswith("重置 "):
+        if self._command_remainder(text, "重置") is not None:
             return "reset"
-        if text == "生图" or text.startswith("生图 "):
+
+        generate_remainder = self._command_remainder(text, "生图")
+        if generate_remainder is not None:
+            if generate_remainder:
+                return "invalid_generate"
+            return "start_generation"
+
+        if self._command_remainder(text, "批量生成") is not None:
             return "generate"
-        if text == "批量生成" or text.startswith("批量生成 "):
-            return "generate"
+        return None
+
+    def _command_remainder(self, text: str, command: str) -> str | None:
+        for prefix in ("/", "／", ""):
+            token = f"{prefix}{command}"
+            if text == token:
+                return ""
+            if text.startswith(token):
+                remainder = text[len(token) :]
+                if remainder and remainder[0].isspace():
+                    return remainder.strip()
         return None
 
     def _is_friend_message(self, event: AstrMessageEvent) -> bool:

@@ -11,6 +11,7 @@ from .reference_buffer import (
     ReferenceBuffer,
     ReferenceSelection,
     parse_generate_command,
+    parse_prompt_message,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "ReferenceBuffer",
     "ReferenceSelection",
     "parse_generate_command",
+    "parse_prompt_message",
 ]
