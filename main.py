@@ -40,7 +40,7 @@ class MicuRuntimeConfig:
     api_key: str
 
 
-@register("astrbot_plugin_NewAPI", "cl", "OpenAI gpt-image-2 Demo", "0.1.0")
+@register("astrbot_plugin_NewAPI", "cl", "OpenAI gpt-image-2 Demo", "0.1.2")
 class MicuImageDemoPlugin(Star):
     """Minimal demo for OpenAI gpt-image-2 generation."""
 
@@ -59,6 +59,8 @@ class MicuImageDemoPlugin(Star):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     async def initialize(self):
+        self.reference_buffer.clear_all()
+        self.generation_sessions.clear()
         if not self.provider_configs:
             logger.warning("[ImageDemo] 未配置可用 API 供应商，/生图 将不可用")
             return
@@ -70,6 +72,8 @@ class MicuImageDemoPlugin(Star):
             task.cancel()
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.generation_sessions.clear()
+        self.reference_buffer.clear_all()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_message(self, event: AstrMessageEvent):
@@ -77,44 +81,54 @@ class MicuImageDemoPlugin(Star):
         if not self._is_friend_message(event):
             return
 
+        unified_msg_origin = event.unified_msg_origin
+
+        if self._is_generation_toggle(event):
+            if unified_msg_origin in self.generation_sessions:
+                self.generation_sessions.discard(unified_msg_origin)
+                self.reference_buffer.clear(unified_msg_origin)
+                yield event.plain_result("已关闭生图功能")
+            else:
+                self.reference_buffer.clear(unified_msg_origin)
+                self.generation_sessions.add(unified_msg_origin)
+                yield event.plain_result("已开启生图功能，发送提示词即可生图，再次双击头像关闭")
+            return
+
         message = self._get_event_text(event)
         command = self._parse_demo_command(message)
-        unified_msg_origin = event.unified_msg_origin
 
         if command == "reset":
             self.reference_buffer.clear(unified_msg_origin)
             yield event.plain_result("已重置当前会话参考图")
             return
 
-        if command == "start_generation":
-            self.generation_sessions.add(unified_msg_origin)
-            count = await self.reference_buffer.cache_plain_message_images(
-                event,
-                self._download_image,
-            )
-            if count:
-                logger.info(
-                    f"[ImageDemo] 已缓存 {count} 张参考图，UMO={event.unified_msg_origin}"
-                )
-            yield event.plain_result("已开启生图功能，发送提示词即可生图，发送 /结束生图 退出")
+        if command == "end_generation_help":
+            yield event.plain_result("请再次双击头像关闭生图功能")
             return
 
-        if command == "end_generation":
-            self.generation_sessions.discard(unified_msg_origin)
-            self.reference_buffer.clear(unified_msg_origin)
-            yield event.plain_result("已结束生图功能")
-            return
-
-        if command == "invalid_generate":
+        if command == "generate_help":
             if unified_msg_origin in self.generation_sessions:
                 yield event.plain_result("生图功能已开启，请直接发送提示词，不要带 /生图")
             else:
-                yield event.plain_result("请发送 /生图 开启生图功能，然后直接发送提示词")
+                yield event.plain_result("请双击头像开启生图功能，或发送 /生图 提示词 临时生图")
+            return
+
+        if command == "temporary_generate":
+            if unified_msg_origin in self.generation_sessions:
+                yield event.plain_result("生图功能已开启，请直接发送提示词，不要带 /生图")
+                return
+            async for result in self._handle_generate_command(
+                event,
+                message,
+                include_buffer=False,
+                session_mode=False,
+            ):
+                yield result
             return
 
         if command == "generate":
             if unified_msg_origin not in self.generation_sessions:
-                yield event.plain_result("请先发送 /生图 开启生图功能")
+                yield event.plain_result("请先双击头像开启生图功能")
                 return
             async for result in self._handle_generate_command(event, message):
                 yield result
@@ -137,10 +151,18 @@ class MicuImageDemoPlugin(Star):
                 f"[ImageDemo] 已缓存 {count} 张参考图，UMO={event.unified_msg_origin}"
             )
 
-    async def _handle_generate_command(self, event: AstrMessageEvent, message: str):
+    async def _handle_generate_command(
+        self,
+        event: AstrMessageEvent,
+        message: str,
+        *,
+        include_buffer: bool = True,
+        session_mode: bool = True,
+    ):
         selection = await self.reference_buffer.select_for_command(
             event,
             self._download_image,
+            include_buffer=include_buffer,
         )
         logger.info(
             f"[ImageDemo] 收到生图命令，UMO={event.unified_msg_origin}，"
@@ -148,7 +170,7 @@ class MicuImageDemoPlugin(Star):
         )
         parsed = parse_prompt_message(message, selection.has_images)
         if not parsed.ok or not parsed.command:
-            yield event.plain_result(parsed.error or "请发送提示词，或发送 /结束生图 退出")
+            yield event.plain_result(parsed.error or "请发送提示词，或再次双击头像关闭")
             return
 
         balance_check = self.balance_manager.precheck(event.unified_msg_origin, parsed.command.n)
@@ -181,9 +203,13 @@ class MicuImageDemoPlugin(Star):
         if parsed.command.warning:
             yield event.plain_result(parsed.command.warning)
 
-        yield event.plain_result("正在生图中，可以继续写提示词")
+        if session_mode:
+            yield event.plain_result("正在生图中，可以继续写提示词")
+        else:
+            yield event.plain_result("正在生图中")
 
-        self.reference_buffer.clear_after_task_created(event.unified_msg_origin)
+        if session_mode:
+            self.reference_buffer.clear_after_task_created(event.unified_msg_origin)
         task = asyncio.create_task(
             self._generate_and_send(
                 prompt=parsed.command.prompt,
@@ -204,7 +230,7 @@ class MicuImageDemoPlugin(Star):
     def _parse_demo_command(self, message: str) -> str | None:
         text = message.strip()
         if self._command_remainder(text, "结束生图") is not None:
-            return "end_generation"
+            return "end_generation_help"
 
         if self._command_remainder(text, "重置") is not None:
             return "reset"
@@ -212,8 +238,8 @@ class MicuImageDemoPlugin(Star):
         generate_remainder = self._command_remainder(text, "生图")
         if generate_remainder is not None:
             if generate_remainder:
-                return "invalid_generate"
-            return "start_generation"
+                return "temporary_generate"
+            return "generate_help"
 
         if self._command_remainder(text, "批量生成") is not None:
             return "generate"
@@ -228,6 +254,79 @@ class MicuImageDemoPlugin(Star):
                 remainder = text[len(token) :]
                 if remainder and remainder[0].isspace():
                     return remainder.strip()
+        return None
+
+    def _is_generation_toggle(self, event: AstrMessageEvent) -> bool:
+        target_ids = self._poke_target_ids(event)
+        if not target_ids:
+            return False
+
+        self_id = str(getattr(getattr(event, "message_obj", None), "self_id", "") or "")
+        if not self_id:
+            self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
+        return bool(self_id and self_id in target_ids)
+
+    def _poke_target_ids(self, event: AstrMessageEvent) -> set[str]:
+        target_ids: set[str] = set()
+        for component in self._iter_event_components(event):
+            if self._is_poke_component(component):
+                target_id = self._poke_target_id(component)
+                if target_id:
+                    target_ids.add(target_id)
+
+        raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if isinstance(raw_message, dict):
+            if str(raw_message.get("sub_type") or "").lower() == "poke":
+                target_id = raw_message.get("target_id")
+                if target_id not in (None, ""):
+                    target_ids.add(str(target_id))
+            for component in self._raw_components(raw_message):
+                if self._is_poke_component(component):
+                    target_id = self._poke_target_id(component)
+                    if target_id:
+                        target_ids.add(target_id)
+        return target_ids
+
+    def _iter_event_components(self, event: AstrMessageEvent) -> list[object]:
+        message = getattr(getattr(event, "message_obj", None), "message", None)
+        return list(message or [])
+
+    def _raw_components(self, raw_message: dict[str, Any]) -> list[object]:
+        value = raw_message.get("message") or raw_message.get("raw_message")
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            return [value]
+        return []
+
+    def _is_poke_component(self, component: object) -> bool:
+        if isinstance(component, Comp.Poke):
+            return True
+        if component.__class__.__name__ == "Poke":
+            return True
+        if isinstance(component, dict):
+            return str(component.get("type") or component.get("_type") or "").lower() == "poke"
+        return False
+
+    def _poke_target_id(self, component: object) -> str | None:
+        target_id = getattr(component, "target_id", None)
+        if callable(target_id):
+            value = target_id()
+            if value not in (None, ""):
+                return str(value)
+
+        for attr in ("id", "qq"):
+            value = getattr(component, attr, None)
+            if value not in (None, "", 0, "0"):
+                return str(value)
+
+        if isinstance(component, dict):
+            data = component.get("data")
+            for source in (component, data if isinstance(data, dict) else {}):
+                for key in ("id", "qq", "target_id"):
+                    value = source.get(key)
+                    if value not in (None, "", 0, "0"):
+                        return str(value)
         return None
 
     def _is_friend_message(self, event: AstrMessageEvent) -> bool:

@@ -73,6 +73,9 @@ class ReferenceBuffer:
     def clear(self, unified_msg_origin: str) -> None:
         self._buffers.pop(unified_msg_origin, None)
 
+    def clear_all(self) -> None:
+        self._buffers.clear()
+
     def clear_after_task_created(self, unified_msg_origin: str) -> None:
         self.clear(unified_msg_origin)
 
@@ -89,6 +92,7 @@ class ReferenceBuffer:
         self,
         event: MessageEventLike,
         download_image: ImageDownloader,
+        include_buffer: bool = True,
     ) -> ReferenceSelection:
         current_images = await extract_current_message_images(event, download_image)
         if current_images:
@@ -98,9 +102,10 @@ class ReferenceBuffer:
         if reply_images:
             return ReferenceSelection(reply_images, "reply")
 
-        buffered_images = self.get(event.unified_msg_origin)
-        if buffered_images:
-            return ReferenceSelection(buffered_images, "buffer")
+        if include_buffer:
+            buffered_images = self.get(event.unified_msg_origin)
+            if buffered_images:
+                return ReferenceSelection(buffered_images, "buffer")
 
         return ReferenceSelection([], "none")
 
