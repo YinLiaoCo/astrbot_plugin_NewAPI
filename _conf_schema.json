@@ -5,7 +5,7 @@
     "hint": "配置生图接口分组。当前插件会按用户余额条目中选择的分组调用对应接口。",
     "templates": {
       "provider": {
-        "name": "添加供应商",
+        "name": "供应商",
         "hint": "每个条目的分组名称必须唯一",
         "items": {
           "name": {
@@ -24,34 +24,6 @@
             "type": "string",
             "default": "",
             "hint": "接口地址字段填写 /v1/... 路径时，会拼接到该 Base URL；填写完整 URL 时直接使用完整 URL。"
-          },
-          "text_to_image_enabled": {
-            "description": "启用文生图",
-            "type": "bool",
-            "default": true
-          },
-          "text_to_image_endpoint": {
-            "description": "文生图接口地址",
-            "type": "string",
-            "default": "/v1/images/generations",
-            "hint": "仅在启用文生图时生效。"
-          },
-          "image_to_image_enabled": {
-            "description": "启用图生图",
-            "type": "bool",
-            "default": true
-          },
-          "image_to_image_endpoint": {
-            "description": "图生图接口地址",
-            "type": "string",
-            "default": "/v1/images/edits",
-            "hint": "仅在启用图生图时生效，官方 gpt-image-2 单图和多图参考都使用 image[] 提交到该接口。"
-          },
-          "multi_reference_endpoint": {
-            "description": "多参考图接口地址",
-            "type": "string",
-            "default": "/v1/images/edits",
-            "hint": "兼容旧配置保留；官方 gpt-image-2 多参考图同样使用 /v1/images/edits。"
           },
           "proxy": {
             "description": "代理地址",
@@ -79,7 +51,7 @@
     "hint": "配置允许使用生图的会话 UMO 与充值额度",
     "templates": {
       "user": {
-        "name": "添加用户",
+        "name": "用户",
         "items": {
           "name": {
             "description": "用户名称",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import time
 from dataclasses import dataclass
@@ -409,6 +410,10 @@ class MicuImageDemoPlugin(Star):
 
     async def _download_image(self, url: str) -> tuple[bytes, str] | None:
         try:
+            data = self._decode_inline_image(url)
+            if data is not None:
+                return data, self._detect_mime_type(data)
+
             path = self._local_path_from_image_ref(url)
             if path is not None:
                 if not path.exists() or not path.is_file():
@@ -427,6 +432,21 @@ class MicuImageDemoPlugin(Star):
             return data, self._detect_mime_type(data)
         except Exception as exc:
             logger.warning(f"[ImageDemo] 提取参考图失败: {exc}")
+            return None
+
+    def _decode_inline_image(self, image_ref: str) -> bytes | None:
+        value = image_ref.strip()
+        if value.startswith("base64://"):
+            payload = value[len("base64://") :]
+        elif value.startswith("data:image/") and ";base64," in value:
+            payload = value.split(";base64,", 1)[1]
+        else:
+            return None
+
+        payload = "".join(payload.split())
+        try:
+            return base64.b64decode(payload, validate=False)
+        except Exception:
             return None
 
     def _clean_base_url(self, base_url: str) -> str:
